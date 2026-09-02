@@ -1,0 +1,15 @@
+[Unit]
+Description=docrender-api boring conversion API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/docrender-api
+EnvironmentFile=%h/.secrets/docrender.env
+ExecStart=%h/docrender-api/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8091
+Restart=always
+RestartSec=5
+MemoryMax=350M
+
+[Install]
+WantedBy=default.target
