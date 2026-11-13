@@ -33,8 +33,8 @@ def _valid(user_key: str) -> bool:
         con.close()
 
 
-def _check(user_key: str) -> None:
-    if not user_key or not _valid(user_key):
+def _check(user_key: str, trusted: bool = False) -> None:
+    if not trusted and (not user_key or not _valid(user_key)):
         raise HTTPException(401, "bad key")
     con = _db()
     try:
@@ -48,7 +48,35 @@ def _check(user_key: str) -> None:
         con.close()
 
 
+def _auth(x_api_key: str, x_rapidapi_key: str, x_rapidapi_proxy_secret: str) -> tuple[str, bool]:
+    """Resolve the caller identity. RapidAPI keys are vouched for by their proxy secret."""
+    expected = os.environ.get("DOCRENDER_RAPIDAPI_SECRET", "")
+    if x_rapidapi_key:
+        if not expected or x_rapidapi_proxy_secret != expected:
+            raise HTTPException(401, "bad rapidapi proxy secret")
+        return x_rapidapi_key, True
+    return x_api_key, False
+
+
 app = FastAPI(title="docrender-api")
+
+_orig_openapi = app.openapi
+
+
+def _openapi_with_auth():
+    """RapidAPI meters a key only if the spec declares its header as a security scheme."""
+    spec = _orig_openapi()
+    schemes = spec.setdefault("components", {}).setdefault("securitySchemes", {})
+    schemes["RapidApiKey"] = {"type": "apiKey", "in": "header", "name": "X-RapidAPI-Key"}
+    schemes["DirectApiKey"] = {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+    for path in ("/v1/render/pdf", "/v1/convert/image", "/v1/usage"):
+        for op in spec.get("paths", {}).get(path, {}).values():
+            if isinstance(op, dict):
+                op["security"] = [{"RapidApiKey": []}, {"DirectApiKey": []}]
+    return spec
+
+
+app.openapi = _openapi_with_auth
 
 
 class PDFIn(BaseModel):
@@ -66,8 +94,13 @@ def health():
 
 
 @app.get("/v1/usage")
-def usage(x_api_key: str = Header(default="")):
-    if not _valid(x_api_key):
+def usage(
+    x_api_key: str = Header(default=""),
+    x_rapidapi_key: str = Header(default=""),
+    x_rapidapi_proxy_secret: str = Header(default=""),
+):
+    x_api_key, trusted = _auth(x_api_key, x_rapidapi_key, x_rapidapi_proxy_secret)
+    if not trusted and not _valid(x_api_key):
         raise HTTPException(401, "bad key")
     con = _db()
     try:
@@ -85,8 +118,13 @@ def landing():
 
 
 @app.post("/v1/render/pdf")
-def render_pdf(body: PDFIn, x_api_key: str = Header(default="")):
-    _check(x_api_key)
+def render_pdf(
+    body: PDFIn,
+    x_api_key: str = Header(default=""),
+    x_rapidapi_key: str = Header(default=""),
+    x_rapidapi_proxy_secret: str = Header(default=""),
+):
+    _check(*_auth(x_api_key, x_rapidapi_key, x_rapidapi_proxy_secret))
     from fpdf import FPDF  # ponytail: lazy import, keeps /health light
 
     pdf = FPDF()
@@ -97,8 +135,13 @@ def render_pdf(body: PDFIn, x_api_key: str = Header(default="")):
 
 
 @app.post("/v1/convert/image")
-def convert_image(body: ImgIn, x_api_key: str = Header(default="")):
-    _check(x_api_key)
+def convert_image(
+    body: ImgIn,
+    x_api_key: str = Header(default=""),
+    x_rapidapi_key: str = Header(default=""),
+    x_rapidapi_proxy_secret: str = Header(default=""),
+):
+    _check(*_auth(x_api_key, x_rapidapi_key, x_rapidapi_proxy_secret))
     import urllib.request  # ponytail: stdlib fetch, no new dep
 
     if not body.url.startswith(("http://", "https://")):
@@ -111,7 +154,9 @@ def convert_image(body: ImgIn, x_api_key: str = Header(default="")):
     from PIL import Image  # ponytail: lazy import, keeps /health light
 
     try:
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        img = Image.open(io.BytesIO(raw))
+        img.draft("RGB", (body.width, body.width * 4))  # ponytail: decode at target scale, cuts peak RSS ~5x
+        img = img.convert("RGB")
     except Exception:
         raise HTTPException(400, "not an image")
     img.thumbnail((body.width, body.width * 4))
